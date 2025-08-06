@@ -1,41 +1,88 @@
-// server/index.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
+
+// Enhanced CORS configuration
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE']
+}));
+
+// Rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP, please try again later'
+});
+app.use('/api/', apiLimiter);
+
 app.use(express.json());
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+// MongoDB Connection with enhanced settings
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  retryWrites: true,
+  w: 'majority'
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
 
-// User Schema
+// Enhanced Schemas
+const MemoryEntrySchema = new mongoose.Schema({
+  id: { type: String, default: uuidv4 },
+  input: { type: String, required: true },
+  response: { type: String, required: true },
+  confidence: { type: Number, default: 0.5 },
+  lastUsed: { type: Date, default: Date.now }
+});
+
+const PatternSchema = new mongoose.Schema({
+  word: { type: String, required: true, index: true },
+  responses: [{ type: String }]
+});
+
 const UserSchema = new mongoose.Schema({
-  username: { type: String, unique: true },
-  password: String,
-  jarvisMemory: Object,
+  username: { type: String, unique: true, required: true, index: true },
+  password: { type: String, required: true },
+  jarvisMemory: {
+    knowledge: [MemoryEntrySchema],
+    patterns: [PatternSchema]
+  },
+  refreshToken: String,
   createdAt: { type: Date, default: Date.now }
 });
+
 const User = mongoose.model('User', UserSchema);
 
-// JWT Authentication Middleware
-const authenticate = (req, res, next) => {
+// JWT helpers
+const generateAccessToken = (userId) => {
+  return jwt.sign({ _id: userId }, process.env.JWT_SECRET, { expiresIn: '15m' });
+};
+
+const generateRefreshToken = () => {
+  return jwt.sign({}, process.env.REFRESH_SECRET, { expiresIn: '7d' });
+};
+
+// Authentication middleware
+const authenticate = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).send('Access denied');
+  if (!token) return res.status(401).json({ error: 'Access token required' });
 
   try {
-    const verified = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = verified;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded._id).select('-password -refreshToken');
     next();
   } catch (err) {
-    res.status(400).send('Invalid token');
+    res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 
@@ -43,8 +90,11 @@ const authenticate = (req, res, next) => {
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
     const user = new User({
       username,
       password: hashedPassword,
@@ -52,9 +102,11 @@ app.post('/api/register', async (req, res) => {
     });
     
     await user.save();
-    res.status(201).send('User created');
+    res.status(201).json({ message: 'User created successfully' });
   } catch (err) {
-    res.status(400).send(err.message);
+    res.status(400).json({ 
+      error: err.code === 11000 ? 'Username already exists' : 'Registration failed' 
+    });
   }
 });
 
@@ -62,66 +114,55 @@ app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
-    if (!user) return res.status(404).send('User not found');
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     const validPass = await bcrypt.compare(password, user.password);
-    if (!validPass) return res.status(400).send('Invalid password');
+    if (!validPass) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1d' });
-    res.header('Authorization', token).send({ token });
-  } catch (err) {
-    res.status(400).send(err.message);
-  }
-});
+    const accessToken = generateAccessToken(user._id);
+    const refreshToken = generateRefreshToken();
+    
+    user.refreshToken = refreshToken;
+    await user.save();
 
-app.post('/api/learn', authenticate, async (req, res) => {
-  try {
-    const { input, response } = req.body;
-    await User.findByIdAndUpdate(req.user._id, {
-      $push: { 'jarvisMemory.knowledge': { input, response } }
+    res.json({
+      accessToken,
+      refreshToken,
+      user: { id: user._id, username: user.username }
     });
-    res.send('Memory updated');
   } catch (err) {
-    res.status(400).send(err.message);
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
-app.get('/api/recall', authenticate, async (req, res) => {
+app.post('/api/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(401).json({ error: 'Refresh token required' });
+
   try {
-    const user = await User.findById(req.user._id);
-    res.json(user.jarvisMemory);
+    const user = await User.findOne({ refreshToken });
+    if (!user) return res.status(403).json({ error: 'Invalid refresh token' });
+
+    jwt.verify(refreshToken, process.env.REFRESH_SECRET);
+    const newAccessToken = generateAccessToken(user._id);
+    res.json({ accessToken: newAccessToken });
   } catch (err) {
-    res.status(400).send(err.message);
+    res.status(403).json({ error: 'Invalid or expired refresh token' });
   }
 });
 
-app.post('/api/synthesize', authenticate, async (req, res) => {
-  try {
-    const { text } = req.body;
-    // In a real implementation, you might call a TTS service here
-    // For now, we'll just return the text with speech markers
-    const response = {
-      text,
-      speech: {
-        text: text,
-        voice: 'en-US-1', // Voice identifier
-        rate: 1.2,        // Speaking rate
-        pitch: 1.0        // Pitch adjustment
-      }
-    };
-    res.json(response);
-  } catch (err) {
-    res.status(400).send(err.message);
-  }
-});
-
-
-// Save memory
+// Memory operations
 app.post('/api/memory', authenticate, async (req, res) => {
   try {
     const { input, response } = req.body;
     await User.findByIdAndUpdate(req.user._id, {
-      $push: { 'jarvisMemory.knowledge': { input, response } }
+      $push: { 
+        'jarvisMemory.knowledge': { 
+          input, 
+          response,
+          lastUsed: new Date()
+        } 
+      }
     });
     res.json({ message: 'Memory updated' });
   } catch (err) {
@@ -129,14 +170,39 @@ app.post('/api/memory', authenticate, async (req, res) => {
   }
 });
 
-// Load memory
 app.get('/api/memory', authenticate, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
+    const user = await User.findById(req.user._id)
+      .select('jarvisMemory -_id');
     res.json(user.jarvisMemory);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// TTS endpoint
+app.post('/api/synthesize', authenticate, async (req, res) => {
+  try {
+    const { text } = req.body;
+    // In production, integrate with a TTS service here
+    res.json({
+      text,
+      speech: {
+        text,
+        voice: 'en-US-Wavenet-D',
+        rate: 1.1,
+        pitch: 0.9
+      }
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 const PORT = process.env.PORT || 5000;
