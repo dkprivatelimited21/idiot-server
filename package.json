@@ -14,9 +14,8 @@
     "JARVIS",
     "chatbot"
   ],
-  "author": "Your Name",
+  "author": "dk",
   "license": "MIT",
-  {
   "dependencies": {
     "express": "^4.18.0",
     "mongoose": "^7.0.0",
