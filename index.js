@@ -11,6 +11,40 @@ const validator = require('validator');
 
 const app = express();
 
+// Signup route
+app.post('/api/auth/signup', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'All fields required' });
+
+  const existing = await User.findOne({ username });
+  if (existing) return res.status(409).json({ error: 'User already exists' });
+
+  const hashedPassword = await bcrypt.hash(password, 12);
+
+  const user = new User({ username, password: hashedPassword });
+  await user.save();
+
+  const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token });
+});
+
+// Login route
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'All fields required' });
+
+  const user = await User.findOne({ username });
+  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const isMatch = await bcrypt.compare(password, user.password);
+  if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token });
+});
+
+
+
 // Validate required environment variables
 const requiredEnvVars = ['JWT_SECRET', 'REFRESH_SECRET', 'MONGODB_URI'];
 const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
@@ -18,6 +52,10 @@ if (missingEnvVars.length > 0) {
   console.error('Missing required environment variables:', missingEnvVars.join(', '));
   process.exit(1);
 }
+
+
+
+
 
 // Middleware setup
 app.use(helmet());
