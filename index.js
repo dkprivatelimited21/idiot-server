@@ -26,6 +26,11 @@ app.use('/api/', apiLimiter);
 
 app.use(express.json());
 
+app.use("/test", (req, res) => {
+  res.send("Hello world!");
+});
+
+
 // MongoDB Connection with enhanced settings
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
